@@ -1,0 +1,58 @@
+# poly-sdk
+
+> Unified TypeScript SDK for Polymarket prediction markets — order placement, real-time data, smart money analysis, and arbitrage.
+
+Built by [@hhhx402](https://x.com/hhhx402) for [Catalyst.fun](https://x.com/catalystdotfun). MIT licensed. Source: https://github.com/cyl19970726/poly-sdk
+
+## Onboarding
+
+- [Contributor Guide](wiki/onboarding/contributor.md): Setup, architecture, testing workflow, and contribution patterns for engineers joining the project.
+- [Staff Engineer Guide](wiki/onboarding/staff-engineer.md): Dense architectural analysis, design decisions, and system properties for staff/principal engineers.
+- [Executive Guide](wiki/onboarding/executive.md): Capability map, risk assessment, and technology investment thesis.
+- [Product Manager Guide](wiki/onboarding/product-manager.md): User journeys, feature map, limitations, and FAQ for non-engineers.
+
+## Getting Started
+
+- [Overview](wiki/01-getting-started/01-overview.md): What poly-sdk is, why it exists, the three-layer architecture.
+- [Installation & Setup](wiki/01-getting-started/02-installation.md): Prerequisites, install, TypeScript config, credentials, logger setup.
+- [Quick Start](wiki/01-getting-started/03-quick-start.md): Five working examples covering market discovery, orders, real-time, wallet analysis, and arbitrage.
+- [Core Concepts](wiki/01-getting-started/04-core-concepts.md): Prediction markets, CTF, CLOB, NegRisk, conditionId vs tokenId.
+- [API Quick Reference](wiki/01-getting-started/05-quick-reference.md): Complete index of all exported classes, functions, and types.
+
+## Architecture
+
+- [System Overview](wiki/02-architecture/01-system-overview.md): Three-layer design, component responsibilities, dependency graph.
+- [WebSocket Design](wiki/02-architecture/02-websocket.md): Three WS endpoints, subscription lifecycle, sub-ACK watchdog, reconnection.
+- [Data Model](wiki/02-architecture/03-data-model.md): Order state machine, core types, market hierarchy, on-chain types.
+
+## API Clients
+
+- [DataApiClient](wiki/03-clients/01-data-api.md): Positions, activity, trades, leaderboard, holders.
+- [GammaApiClient](wiki/03-clients/02-gamma-api.md): Market discovery, search, trending, events.
+- [SubgraphClient](wiki/03-clients/03-subgraph.md): On-chain data via Goldsky — splits, merges, redemptions, OI.
+- [CTFClient](wiki/03-clients/04-ctf-client.md): Split/merge/redeem Conditional Token Framework positions.
+- [BridgeClient](wiki/03-clients/05-bridge-client.md): Cross-chain deposit infrastructure.
+
+## Services
+
+- [TradingService](wiki/04-services/01-trading-service.md): Limit/market orders, cancellation, rewards, account management.
+- [MarketService](wiki/04-services/02-market-service.md): Market search, K-lines, orderbook analytics, arbitrage detection.
+- [WalletService](wiki/04-services/03-wallet-service.md): Positions, PnL, activity, leaderboard.
+- [RealtimeServiceV2](wiki/04-services/04-realtime-service.md): WebSocket subscriptions — orderbook, price changes, user orders, crypto prices.
+- [ArbitrageService](wiki/04-services/05-arbitrage-service.md): Automated arb scan, execute, rebalance, settle.
+- [DipArbService](wiki/04-services/06-dip-arb-service.md): 15m crypto dip arbitrage for UP/DOWN markets.
+- [SmartMoneyService](wiki/04-services/07-smart-money-service.md): Smart wallet identification, copy trading, trade monitoring, reports.
+
+## Core Infrastructure
+
+- [Error Handling](wiki/05-infrastructure/01-error-handling.md): PolymarketError, ErrorCode enum, withRetry utility.
+- [Rate Limiting](wiki/05-infrastructure/02-rate-limiting.md): Per-API Bottleneck configuration and shared limiter patterns.
+- [Caching](wiki/05-infrastructure/03-caching.md): TTL cache, CACHE_TTL constants, UnifiedCache adapter.
+- [Logger System](wiki/05-infrastructure/04-logger-system.md): Fail-loud invariant, injection patterns, production incident history.
+
+## Optional
+
+- [Copy Trading](wiki/06-advanced/01-copy-trading.md): Step-by-step guide to building a copy trading system.
+- [Arbitrage Strategies](wiki/06-advanced/02-arbitrage-strategies.md): Long arb, short arb, dip arb mechanics and profitability.
+- [CTF Operations](wiki/06-advanced/03-ctf-operations.md): Split, merge, redeem, NegRisk markets.
+- [Order Lifecycle](wiki/06-advanced/04-order-lifecycle.md): State machine, status utilities, order type lifecycles.

@@ -52,6 +52,7 @@
   "publishConfig": {
     "access": "public"
   },
+ 
   "dependencies": {
     "@catalyst-team/cache": "^0.2.0",
     "@polymarket/builder-relayer-client": "0.0.9",

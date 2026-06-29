@@ -32,7 +32,7 @@ import { GammaApiClient } from '../clients/gamma-api.js';
 import { RateLimiter } from '../core/rate-limiter.js';
 import { createUnifiedCache } from '../core/unified-cache.js';
 import { getEffectivePrices } from '../utils/price-utils.js';
-import { createModuleLogger } from '../core/logger.js';
+import { createModuleLogger, type Logger } from '../core/logger.js';
 
 const log = createModuleLogger('arbitrage');
 import type { BookUpdate } from '../core/types.js';
@@ -91,6 +91,8 @@ export interface ArbitrageServiceConfig {
   sizeSafetyFactor?: number;
   /** Auto-fix imbalance after failed execution (default: true) */
   autoFixImbalance?: boolean;
+  /** Optional structured logger, propagated to the internal RealtimeServiceV2 watchdog */
+  logger?: Logger;
 }
 
 export interface RebalanceAction {
@@ -256,10 +258,11 @@ export class ArbitrageService extends EventEmitter {
   private rateLimiter: RateLimiter;
 
   private market: ArbitrageMarketConfig | null = null;
-  private config: Omit<Required<ArbitrageServiceConfig>, 'privateKey' | 'rpcUrl' | 'rebalanceInterval'> & {
+  private config: Omit<Required<ArbitrageServiceConfig>, 'privateKey' | 'rpcUrl' | 'rebalanceInterval' | 'logger'> & {
     privateKey?: string;
     rpcUrl?: string;
     rebalanceIntervalMs: number;
+    logger?: Logger;
   };
 
   private orderbook: OrderbookState = {
@@ -318,10 +321,11 @@ export class ArbitrageService extends EventEmitter {
       // Execution safety
       sizeSafetyFactor: config.sizeSafetyFactor ?? 0.8,
       autoFixImbalance: config.autoFixImbalance ?? true,
+      logger: config.logger,
     };
 
     this.rateLimiter = new RateLimiter();
-    this.realtimeService = new RealtimeServiceV2({ debug: false });
+    this.realtimeService = new RealtimeServiceV2({ debug: false, logger: this.config.logger });
 
     // Initialize trading clients if private key provided
     if (this.config.privateKey) {
@@ -1592,7 +1596,7 @@ export class ArbitrageService extends EventEmitter {
 
   private log(message: string): void {
     if (this.config.enableLogging) {
-      log.info(`[ArbitrageService] ${message}`);
+      (this.config.logger ?? log).info(`[ArbitrageService] ${message}`);
     }
   }
 
