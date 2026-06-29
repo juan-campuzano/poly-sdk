@@ -34,3 +34,5 @@ coverage/
 .mcp.json.test-creds.json
 
 wiki/
+
+copy-trades.jsonl
