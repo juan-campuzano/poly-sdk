@@ -30,6 +30,8 @@ interface CopyLogEntry {
   ourAmountUsdc?: number;    // what we sized our copy order to
   ourSlippagePrice?: number; // our worst-acceptable price bound
   remainingBankrollUsdc?: number; // bankroll left after this trade
+  reason?: 'leader' | 'take_profit' | 'stop_loss'; // why this order was placed
+  pnlPercent?: number; // unrealized P&L at the moment of an independent exit
   dryRun: boolean;
   skipped: boolean;
   skipReason?: string;
@@ -54,19 +56,33 @@ const COPY_CONFIG = {
   // Total USDC budget shared across all copied BUYs. Each BUY is scaled down
   // to fit whatever remains; SELLs return their proceeds to the pool (capped
   // at the original bankroll, so profits aren't auto-reinvested).
-  bankroll: 20,
+  bankroll: 50,
   maxSlippage: 0.03,
   orderType: 'FOK' as const,
   minTradeSize: 5,
   dryRun: true, // 👈 cambiar a false cuando quieras operar real
 };
 
+// Independent risk management — exits a position on our own P&L, regardless
+// of whether the leader has sold. Checked on a timer, not on leader activity.
+const RISK_CONFIG = {
+  takeProfitPercent: 0.25, // sell once unrealized gain hits +25%
+  stopLossPercent: 0.15,   // sell once unrealized loss hits -15%
+  checkIntervalMs: 30_000,
+};
+
 // Remaining USDC budget. Decremented on BUYs, replenished (up to bankroll) on SELLs.
 let remainingBankroll = COPY_CONFIG.bankroll;
 
-// Dry-run never places real orders, so there's no on-chain position to check —
-// track simulated USDC value per tokenId instead, fed by our own simulated fills.
-const simulatedPositions = new Map<string, number>();
+// Our own cost-basis bookkeeping per tokenId, used both to cap mirrored SELLs
+// (dry-run has no on-chain position to check) and to evaluate take-profit/stop-loss.
+interface OwnPosition {
+  conditionId: string;
+  outcome?: string;
+  shares: number;
+  costUsdc: number;
+}
+const positions = new Map<string, OwnPosition>();
 
 const onTrade = (trade: TradeEvent, result: { success: boolean; errorMsg?: string }) => {
   console.log(`[COPY] ${trade.address.slice(0, 10)}… | ${trade.side} ${trade.outcome ?? trade.tokenId.slice(0, 8)} @ $${trade.price} | ${result.success ? '✅' : '❌'}`);
@@ -86,12 +102,123 @@ const monitor = new TradeMonitor(sdk.dataApi, { pollIntervalMs: 5_000 });
 const copyEngine = new CopyEngine(sdk.tradingService);
 const myAddress = sdk.tradingService.getAddress();
 
-/** USDC value of our own position in this token, or 0 if we don't hold it. */
+/** USDC value of our own on-chain position in this token, or 0 if we don't hold it (live mode only). */
 async function getMyPositionValueUsdc(conditionId: string, tokenId: string): Promise<number> {
-  const positions = await sdk.dataApi.getPositions(myAddress, { market: [conditionId] });
-  const position = positions.find((p) => p.asset === tokenId);
+  const apiPositions = await sdk.dataApi.getPositions(myAddress, { market: [conditionId] });
+  const position = apiPositions.find((p) => p.asset === tokenId);
   if (!position || position.size <= 0) return 0;
   return position.currentValue ?? position.size * (position.curPrice ?? 0);
+}
+
+/** Record a fill against our own cost-basis bookkeeping (used for sizing caps + P&L checks). */
+function recordFill(tokenId: string, conditionId: string, outcome: string | undefined, side: 'BUY' | 'SELL', amountUsdc: number, fillPrice: number): void {
+  const existing = positions.get(tokenId);
+  if (side === 'BUY') {
+    const shares = amountUsdc / fillPrice;
+    if (existing) {
+      existing.shares += shares;
+      existing.costUsdc += amountUsdc;
+    } else {
+      positions.set(tokenId, { conditionId, outcome, shares, costUsdc: amountUsdc });
+    }
+    return;
+  }
+
+  if (!existing) return;
+  const sharesSold = amountUsdc / fillPrice;
+  const soldFraction = Math.min(1, sharesSold / existing.shares);
+  existing.shares -= sharesSold;
+  existing.costUsdc -= existing.costUsdc * soldFraction;
+  if (existing.shares <= 0.0001) positions.delete(tokenId);
+}
+
+/** Current USDC value of our tracked position in this token, or 0 if we don't hold it. */
+function getOwnPositionValueUsdc(tokenId: string, currentPrice: number): number {
+  const position = positions.get(tokenId);
+  return position ? position.shares * currentPrice : 0;
+}
+
+/**
+ * Sell a position on our own initiative (take-profit/stop-loss), independent of
+ * whatever the leader is doing. Closes the full tracked position.
+ */
+async function closePosition(tokenId: string, reason: 'take_profit' | 'stop_loss', currentPrice: number, pnlPercent: number): Promise<void> {
+  const position = positions.get(tokenId);
+  if (!position) return;
+
+  const amount = position.shares * currentPrice;
+  const slippagePrice = Math.max(currentPrice - COPY_CONFIG.maxSlippage, 0);
+
+  const baseEntry = {
+    loggedAt: new Date().toISOString(),
+    source: 'polling' as const,
+    detectedAt: Date.now(),
+    tradeTimestamp: Date.now(),
+    detectionLatencyMs: 0,
+    address: myAddress,
+    conditionId: position.conditionId,
+    outcome: position.outcome,
+    tokenId,
+    side: 'SELL' as const,
+    leaderPrice: currentPrice,
+    leaderSize: position.shares,
+    leaderValueUsdc: amount,
+    reason,
+    pnlPercent,
+  };
+
+  if (COPY_CONFIG.dryRun) {
+    recordFill(tokenId, position.conditionId, position.outcome, 'SELL', amount, currentPrice);
+    remainingBankroll = Math.min(remainingBankroll + amount, COPY_CONFIG.bankroll);
+    console.log(`[COPY] (dry-run) ${reason.toUpperCase()} exit: SELL $${amount.toFixed(2)} @ ~$${currentPrice.toFixed(4)} | P&L ${(pnlPercent * 100).toFixed(1)}%`);
+    logTrade({ ...baseEntry, dryRun: true, skipped: false, executed: true, ourAmountUsdc: amount, ourSlippagePrice: slippagePrice, remainingBankrollUsdc: remainingBankroll });
+    return;
+  }
+
+  try {
+    const result = await copyEngine.executeOrder({
+      conditionId: position.conditionId,
+      outcome: position.outcome ?? '',
+      tokenId,
+      side: 'SELL',
+      amount,
+      price: slippagePrice,
+      orderType: COPY_CONFIG.orderType,
+    });
+
+    if (result.success) {
+      recordFill(tokenId, position.conditionId, position.outcome, 'SELL', amount, currentPrice);
+      remainingBankroll = Math.min(remainingBankroll + amount, COPY_CONFIG.bankroll);
+    }
+
+    console.log(`[COPY] ${reason.toUpperCase()} exit: SELL $${amount.toFixed(2)} @ ~$${currentPrice.toFixed(4)} | P&L ${(pnlPercent * 100).toFixed(1)}% | ${result.success ? '✅' : '❌'}`);
+    logTrade({ ...baseEntry, dryRun: false, skipped: false, executed: result.success, ourAmountUsdc: amount, ourSlippagePrice: slippagePrice, orderId: result.orderId, errorMsg: result.errorMsg, remainingBankrollUsdc: remainingBankroll });
+  } catch (err) {
+    const error = err instanceof Error ? err : new Error(String(err));
+    onError(error);
+    logTrade({ ...baseEntry, dryRun: false, skipped: false, executed: false, errorMsg: error.message });
+  }
+}
+
+/** Periodic, leader-independent risk check: take-profit / stop-loss on our own tracked positions. */
+async function runRiskCheck(): Promise<void> {
+  for (const [tokenId, position] of Array.from(positions.entries())) {
+    try {
+      const currentPrice = await sdk.markets.getMidpoint(tokenId);
+      const avgEntryPrice = position.costUsdc / position.shares;
+      if (avgEntryPrice <= 0) continue;
+
+      const pnlPercent = (currentPrice - avgEntryPrice) / avgEntryPrice;
+
+      if (pnlPercent >= RISK_CONFIG.takeProfitPercent) {
+        await closePosition(tokenId, 'take_profit', currentPrice, pnlPercent);
+      } else if (pnlPercent <= -RISK_CONFIG.stopLossPercent) {
+        await closePosition(tokenId, 'stop_loss', currentPrice, pnlPercent);
+      }
+    } catch (err) {
+      onError(err instanceof Error ? err : new Error(String(err)));
+    }
+  }
 }
 
 monitor.on('trade', async (trade: TradeEvent) => {
@@ -140,7 +267,7 @@ monitor.on('trade', async (trade: TradeEvent) => {
     // SELLs are sized against what we actually hold, not the leader's trade size —
     // we can't sell more than we have, and if we never copied the BUY there's nothing to mirror.
     const myPositionValue = COPY_CONFIG.dryRun
-      ? (simulatedPositions.get(trade.tokenId) ?? 0)
+      ? getOwnPositionValueUsdc(trade.tokenId, trade.price)
       : await getMyPositionValueUsdc(trade.conditionId, trade.tokenId);
     if (myPositionValue < 1) {
       stats.tradesSkipped++;
@@ -156,15 +283,11 @@ monitor.on('trade', async (trade: TradeEvent) => {
     : Math.max(trade.price - COPY_CONFIG.maxSlippage, 0);
 
   if (COPY_CONFIG.dryRun) {
-    const heldValue = simulatedPositions.get(trade.tokenId) ?? 0;
+    recordFill(trade.tokenId, trade.conditionId, trade.outcome, trade.side, amount, trade.price);
     if (trade.side === 'BUY') {
       remainingBankroll -= amount;
-      simulatedPositions.set(trade.tokenId, heldValue + amount);
     } else {
       remainingBankroll = Math.min(remainingBankroll + amount, COPY_CONFIG.bankroll);
-      const remaining = heldValue - amount;
-      if (remaining > 0.01) simulatedPositions.set(trade.tokenId, remaining);
-      else simulatedPositions.delete(trade.tokenId);
     }
 
     console.log(`[COPY] (dry-run) would ${trade.side} $${amount.toFixed(2)} @ ~$${slippagePrice.toFixed(4)} | bankroll left: $${remainingBankroll.toFixed(2)}`);
@@ -195,6 +318,7 @@ monitor.on('trade', async (trade: TradeEvent) => {
 
     if (result.success) {
       stats.tradesExecuted++;
+      recordFill(trade.tokenId, trade.conditionId, trade.outcome, trade.side, amount, trade.price);
       if (trade.side === 'BUY') {
         remainingBankroll -= amount;
       } else {
@@ -235,6 +359,12 @@ monitor.on('trade', async (trade: TradeEvent) => {
 monitor.watch(targetAddresses, 'polling');
 console.log(`[COPY] Siguiendo ${targetAddresses.length} wallets (dryRun=${COPY_CONFIG.dryRun})`);
 
+// ── RISK MANAGEMENT ───────────────────────────
+// Independent of the leader: take-profit/stop-loss our own open positions.
+const riskCheckInterval = setInterval(() => {
+  runRiskCheck().catch((err) => onError(err instanceof Error ? err : new Error(String(err))));
+}, RISK_CONFIG.checkIntervalMs);
+
 // ── ARBITRAJE ─────────────────────────────────
 // const arbService = sdk.arbitrage ?? null;
 // // El ArbitrageService escanea y loguea oportunidades
@@ -273,6 +403,7 @@ setInterval(() => {
 // Graceful shutdown
 process.on('SIGINT', () => {
   console.log('Deteniendo bot...');
+  clearInterval(riskCheckInterval);
   monitor.stop();
   sdk.stop();
   process.exit(0);
