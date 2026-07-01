@@ -103,3 +103,8 @@ Polymarket 使用三个独立的 WebSocket 端点：
 
 **重要**: USER 事件必须连接 `/ws/user` 端点，不能在 `/ws/market` 上订阅！
 
+
+<!-- SPECKIT START -->
+For additional context about technologies to be used, project structure,
+shell commands, and other important information, read the current plan
+<!-- SPECKIT END -->
