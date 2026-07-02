@@ -52,11 +52,18 @@ function logTrade(entry: CopyLogEntry): void {
 const COPY_CONFIG = {
   topN: 50,
   sizeScale: 0.01,
-  maxSizePerTrade: 10,
+  // Lowered from 10: a handful of large leader trades were each capping out at
+  // maxSizePerTrade and burning through the whole bankroll in minutes, leaving
+  // only 5-7 open positions for the rest of the run. At 3, the same $50
+  // bankroll spreads across ~15+ positions, giving more surface area for
+  // leader-mirrored sells and take-profit/stop-loss to actually trigger.
+  maxSizePerTrade: 1,
+  maxPositionUsdc: 5, // max total cost basis per token across all BUYs
   // Total USDC budget shared across all copied BUYs. Each BUY is scaled down
-  // to fit whatever remains; SELLs return their proceeds to the pool (capped
-  // at the original bankroll, so profits aren't auto-reinvested).
+  // to fit whatever remains; SELLs return their proceeds to the pool (profits
+  // compound — no cap). New BUYs are paused when bankroll < minBankrollFloor.
   bankroll: 50,
+  minBankrollFloor: 10, // pause new BUYs below this balance
   maxSlippage: 0.03,
   orderType: 'FOK' as const,
   minTradeSize: 5,
@@ -66,13 +73,21 @@ const COPY_CONFIG = {
 // Independent risk management — exits a position on our own P&L, regardless
 // of whether the leader has sold. Checked on a timer, not on leader activity.
 const RISK_CONFIG = {
-  takeProfitPercent: 0.25, // sell once unrealized gain hits +25%
-  stopLossPercent: 0.15,   // sell once unrealized loss hits -15%
-  checkIntervalMs: 30_000,
+  takeProfitPercent: 0.10, // sell once unrealized gain hits +10%
+  stopLossPercent: 0.20,   // sell once unrealized loss hits -20%
+  checkIntervalMs: 10_000,
 };
+
+// Only copy tokens in this price range — near-certain outcomes (>0.80) have
+// no room for take-profit and near-zero outcomes (<0.10) are too illiquid.
+const PRICE_FILTER = { min: 0.10, max: 0.80 };
 
 // Remaining USDC budget. Decremented on BUYs, replenished (up to bankroll) on SELLs.
 let remainingBankroll = COPY_CONFIG.bankroll;
+
+// Trades older than this (ms) at detection time are startup replay — we skip
+// order execution for them but still record prices for the risk check.
+const STALE_TRADE_MS = 60_000;
 
 // Our own cost-basis bookkeeping per tokenId, used both to cap mirrored SELLs
 // (dry-run has no on-chain position to check) and to evaluate take-profit/stop-loss.
@@ -83,6 +98,10 @@ interface OwnPosition {
   costUsdc: number;
 }
 const positions = new Map<string, OwnPosition>();
+
+// Latest observed trade price per tokenId, updated from the live Activity feed.
+// Used by runRiskCheck instead of getMidpoint (which fails for illiquid CLOB markets).
+const latestPrices = new Map<string, number>();
 
 const onTrade = (trade: TradeEvent, result: { success: boolean; errorMsg?: string }) => {
   console.log(`[COPY] ${trade.address.slice(0, 10)}… | ${trade.side} ${trade.outcome ?? trade.tokenId.slice(0, 8)} @ $${trade.price} | ${result.success ? '✅' : '❌'}`);
@@ -169,7 +188,7 @@ async function closePosition(tokenId: string, reason: 'take_profit' | 'stop_loss
 
   if (COPY_CONFIG.dryRun) {
     recordFill(tokenId, position.conditionId, position.outcome, 'SELL', amount, currentPrice);
-    remainingBankroll = Math.min(remainingBankroll + amount, COPY_CONFIG.bankroll);
+    remainingBankroll += amount;
     console.log(`[COPY] (dry-run) ${reason.toUpperCase()} exit: SELL $${amount.toFixed(2)} @ ~$${currentPrice.toFixed(4)} | P&L ${(pnlPercent * 100).toFixed(1)}%`);
     logTrade({ ...baseEntry, dryRun: true, skipped: false, executed: true, ourAmountUsdc: amount, ourSlippagePrice: slippagePrice, remainingBankrollUsdc: remainingBankroll });
     return;
@@ -188,7 +207,7 @@ async function closePosition(tokenId: string, reason: 'take_profit' | 'stop_loss
 
     if (result.success) {
       recordFill(tokenId, position.conditionId, position.outcome, 'SELL', amount, currentPrice);
-      remainingBankroll = Math.min(remainingBankroll + amount, COPY_CONFIG.bankroll);
+      remainingBankroll += amount;
     }
 
     console.log(`[COPY] ${reason.toUpperCase()} exit: SELL $${amount.toFixed(2)} @ ~$${currentPrice.toFixed(4)} | P&L ${(pnlPercent * 100).toFixed(1)}% | ${result.success ? '✅' : '❌'}`);
@@ -202,27 +221,43 @@ async function closePosition(tokenId: string, reason: 'take_profit' | 'stop_loss
 
 /** Periodic, leader-independent risk check: take-profit / stop-loss on our own tracked positions. */
 async function runRiskCheck(): Promise<void> {
-  for (const [tokenId, position] of Array.from(positions.entries())) {
-    try {
-      const currentPrice = await sdk.markets.getMidpoint(tokenId);
-      const avgEntryPrice = position.costUsdc / position.shares;
-      if (avgEntryPrice <= 0) continue;
+  const entries = Array.from(positions.entries());
+  if (entries.length === 0) return;
 
-      const pnlPercent = (currentPrice - avgEntryPrice) / avgEntryPrice;
+  console.log(`[RISK] Checking ${entries.length} positions...`);
 
-      if (pnlPercent >= RISK_CONFIG.takeProfitPercent) {
-        await closePosition(tokenId, 'take_profit', currentPrice, pnlPercent);
-      } else if (pnlPercent <= -RISK_CONFIG.stopLossPercent) {
-        await closePosition(tokenId, 'stop_loss', currentPrice, pnlPercent);
-      }
-    } catch (err) {
-      onError(err instanceof Error ? err : new Error(String(err)));
+  for (const [tokenId, position] of entries) {
+    const currentPrice = latestPrices.get(tokenId);
+
+    if (!currentPrice || currentPrice <= 0) {
+      console.log(`[RISK] ${tokenId.slice(0, 12)}... no price seen yet, skipping`);
+      continue;
+    }
+
+    const avgEntryPrice = position.costUsdc / position.shares;
+    if (avgEntryPrice <= 0) continue;
+
+    const pnlPercent = (currentPrice - avgEntryPrice) / avgEntryPrice;
+    console.log(`[RISK] ${tokenId.slice(0, 12)}... entry=${avgEntryPrice.toFixed(4)} cur=${currentPrice.toFixed(4)} pnl=${(pnlPercent * 100).toFixed(1)}%`);
+
+    if (pnlPercent >= RISK_CONFIG.takeProfitPercent) {
+      await closePosition(tokenId, 'take_profit', currentPrice, pnlPercent);
+    } else if (pnlPercent <= -RISK_CONFIG.stopLossPercent) {
+      await closePosition(tokenId, 'stop_loss', currentPrice, pnlPercent);
     }
   }
 }
 
 monitor.on('trade', async (trade: TradeEvent) => {
   stats.tradesDetected++;
+
+  // Keep latest observed trade price for every token — used by runRiskCheck
+  // instead of getMidpoint which fails for illiquid CLOB markets.
+  if (trade.tokenId && trade.price > 0) {
+    latestPrices.set(trade.tokenId, trade.price);
+  }
+
+  const isStale = (trade.detectedAt - trade.timestamp) > STALE_TRADE_MS;
 
   const baseEntry: Omit<CopyLogEntry, 'skipped' | 'skipReason' | 'executed' | 'dryRun'> = {
     loggedAt: new Date().toISOString(),
@@ -239,6 +274,12 @@ monitor.on('trade', async (trade: TradeEvent) => {
     leaderSize: trade.size,
     leaderValueUsdc: trade.price * trade.size,
   };
+
+  if (isStale) {
+    stats.tradesSkipped++;
+    logTrade({ ...baseEntry, dryRun: COPY_CONFIG.dryRun, skipped: true, skipReason: 'stale_trade', executed: false });
+    return;
+  }
 
   const tradeValue = trade.price * trade.size;
   if (tradeValue < COPY_CONFIG.minTradeSize) {
@@ -257,7 +298,24 @@ monitor.on('trade', async (trade: TradeEvent) => {
 
   // BUYs draw down the shared bankroll; scale the order to whatever's left.
   if (trade.side === 'BUY') {
-    amount = Math.min(amount, remainingBankroll);
+    if (trade.price < PRICE_FILTER.min || trade.price > PRICE_FILTER.max) {
+      stats.tradesSkipped++;
+      logTrade({ ...baseEntry, dryRun: COPY_CONFIG.dryRun, skipped: true, skipReason: 'price_out_of_range', executed: false });
+      return;
+    }
+    if (remainingBankroll < COPY_CONFIG.minBankrollFloor) {
+      stats.tradesSkipped++;
+      logTrade({ ...baseEntry, dryRun: COPY_CONFIG.dryRun, skipped: true, skipReason: 'below_floor', executed: false, remainingBankrollUsdc: remainingBankroll });
+      return;
+    }
+    const existingCost = positions.get(trade.tokenId)?.costUsdc ?? 0;
+    const roomInPosition = COPY_CONFIG.maxPositionUsdc - existingCost;
+    if (roomInPosition <= 0) {
+      stats.tradesSkipped++;
+      logTrade({ ...baseEntry, dryRun: COPY_CONFIG.dryRun, skipped: true, skipReason: 'position_cap_reached', executed: false, remainingBankrollUsdc: remainingBankroll });
+      return;
+    }
+    amount = Math.min(amount, remainingBankroll, roomInPosition);
     if (amount < 1) {
       stats.tradesSkipped++;
       logTrade({ ...baseEntry, dryRun: COPY_CONFIG.dryRun, skipped: true, skipReason: 'bankroll_exhausted', executed: false, remainingBankrollUsdc: remainingBankroll });
@@ -287,7 +345,7 @@ monitor.on('trade', async (trade: TradeEvent) => {
     if (trade.side === 'BUY') {
       remainingBankroll -= amount;
     } else {
-      remainingBankroll = Math.min(remainingBankroll + amount, COPY_CONFIG.bankroll);
+      remainingBankroll += amount;
     }
 
     console.log(`[COPY] (dry-run) would ${trade.side} $${amount.toFixed(2)} @ ~$${slippagePrice.toFixed(4)} | bankroll left: $${remainingBankroll.toFixed(2)}`);
@@ -322,7 +380,7 @@ monitor.on('trade', async (trade: TradeEvent) => {
       if (trade.side === 'BUY') {
         remainingBankroll -= amount;
       } else {
-        remainingBankroll = Math.min(remainingBankroll + amount, COPY_CONFIG.bankroll);
+        remainingBankroll += amount;
       }
     } else {
       stats.tradesFailed++;

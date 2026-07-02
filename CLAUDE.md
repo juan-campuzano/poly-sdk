@@ -103,3 +103,10 @@ Polymarket 使用三个独立的 WebSocket 端点：
 
 **重要**: USER 事件必须连接 `/ws/user` 端点，不能在 `/ws/market` 上订阅！
 
+
+<!-- SPECKIT START -->
+Active feature plan: `specs/001-unified-trading-bot-tui/plan.md`
+(unified steerable TUI over the three strategy bots; artifacts: research.md,
+data-model.md, contracts/, quickstart.md). Read it for technologies, project
+structure, and design decisions before working on that feature.
+<!-- SPECKIT END -->
