@@ -121,9 +121,6 @@ export class DipArbService extends EventEmitter {
   // Price state
   private currentUnderlyingPrice = 0;
 
-  // Signal state - prevent duplicate signals within same round
-  private leg1SignalEmitted = false;
-
   // Smart logging state - reduce orderbook noise
   private lastOrderbookLogTime = 0;
   private readonly ORDERBOOK_LOG_INTERVAL_MS = 10000;  // Log orderbook every 10 seconds
@@ -992,6 +989,18 @@ export class DipArbService extends EventEmitter {
   private async checkAndStartNewRound(): Promise<void> {
     if (!this.market) return;
 
+    // Expire a waiting round whose detection window has closed so the next
+    // tick creates a fresh round (prevents the bot from going permanently silent
+    // after windowMinutes with no signal).
+    if (this.currentRound && this.currentRound.phase === 'waiting') {
+      const elapsedMin = (Date.now() - this.currentRound.startTime) / 60000;
+      if (elapsedMin > this.config.windowMinutes) {
+        this.currentRound.phase = 'expired';
+        this.stats.roundsExpired++;
+        this.stats.roundsCompleted++;
+      }
+    }
+
     // If no current round or current round is completed/expired, start new round
     if (!this.currentRound || this.currentRound.phase === 'completed' || this.currentRound.phase === 'expired') {
       // Check if market is still active
@@ -1022,9 +1031,6 @@ export class DipArbService extends EventEmitter {
 
       // Clear price history for new round - we only want to detect instant drops within this round
       this.priceHistory = [];
-
-      // Reset signal state for new round
-      this.leg1SignalEmitted = false;
 
       this.stats.roundsMonitored++;
 

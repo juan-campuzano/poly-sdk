@@ -36,3 +36,9 @@ coverage/
 wiki/
 
 copy-trades.jsonl
+
+# Unified bot runtime files
+unified-trades.jsonl
+arbitrage-trades.jsonl
+dip-arb-trades.jsonl
+unified-session.json

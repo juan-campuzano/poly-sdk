@@ -105,6 +105,8 @@ Polymarket 使用三个独立的 WebSocket 端点：
 
 
 <!-- SPECKIT START -->
-For additional context about technologies to be used, project structure,
-shell commands, and other important information, read the current plan
+Active feature plan: `specs/001-unified-trading-bot-tui/plan.md`
+(unified steerable TUI over the three strategy bots; artifacts: research.md,
+data-model.md, contracts/, quickstart.md). Read it for technologies, project
+structure, and design decisions before working on that feature.
 <!-- SPECKIT END -->
