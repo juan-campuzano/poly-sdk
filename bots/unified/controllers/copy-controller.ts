@@ -20,6 +20,7 @@ interface OwnPosition {
   outcome?: string;
   shares: number;
   costUsdc: number;
+  openedAt: number;
 }
 
 export class CopyController extends EventEmitter implements StrategyController {
@@ -65,7 +66,11 @@ export class CopyController extends EventEmitter implements StrategyController {
             log.warn(`[copy-controller] trade handling error: ${err instanceof Error ? err.message : String(err)}`);
           });
         }
-        this.latestPrices.set(tradeEvent.tokenId, tradeEvent.price);
+        // Only track prices for tokens we hold — otherwise every tokenId ever
+        // traded by any watched wallet accumulates here forever.
+        if (this.positions.has(tradeEvent.tokenId)) {
+          this.latestPrices.set(tradeEvent.tokenId, tradeEvent.price);
+        }
       });
 
       this.monitor.on('error', (err: Error) => {
@@ -115,6 +120,9 @@ export class CopyController extends EventEmitter implements StrategyController {
       const priceMin = this._params.priceFilterMin ?? 0.10;
       const priceMax = this._params.priceFilterMax ?? 0.80;
       if (tradeEvent.price < priceMin || tradeEvent.price > priceMax) return;
+
+      const maxPos = this._params.maxPositions ?? 10;
+      if (!this.positions.has(tradeEvent.tokenId) && this.positions.size >= maxPos) return;
 
       const existingCost = this.positions.get(tradeEvent.tokenId)?.costUsdc ?? 0;
       const roomInPosition = (this._params.maxPositionUsdc ?? 5) - existingCost;
@@ -175,9 +183,23 @@ export class CopyController extends EventEmitter implements StrategyController {
   }
 
   private _runRiskCheck(): void {
+    const now = Date.now();
+    const maxAgeMs = this._params.maxPositionAgeMs ?? 8 * 3600 * 1000;
+
     for (const [tokenId, pos] of this.positions) {
-      const price = this.latestPrices.get(tokenId);
-      if (price == null) continue;
+      // Auto-close positions held past the TTL regardless of price
+      if (now - pos.openedAt >= maxAgeMs) {
+        const price = this.latestPrices.get(tokenId) ?? pos.costUsdc / pos.shares;
+        const currentValue = pos.shares * price;
+        this._realizedPnl += currentValue - pos.costUsdc;
+        this.ledger.release('copy-trade', pos.costUsdc);
+        this._closePositionInternal(tokenId, price, 'ttl_expired');
+        this._emitStatus();
+        continue;
+      }
+
+      // Fall back to entry price if no update has arrived yet
+      const price = this.latestPrices.get(tokenId) ?? pos.costUsdc / pos.shares;
       const currentValue = pos.shares * price;
       const pnlPercent = (currentValue - pos.costUsdc) / pos.costUsdc;
 
@@ -203,6 +225,7 @@ export class CopyController extends EventEmitter implements StrategyController {
     if (!pos) return;
     const amount = pos.shares * price;
     this.positions.delete(tokenId);
+    this.latestPrices.delete(tokenId);
     const t: Trade = {
       loggedAt: new Date().toISOString(),
       strategy: 'copy-trade',
@@ -229,7 +252,7 @@ export class CopyController extends EventEmitter implements StrategyController {
         existing.shares += shares;
         existing.costUsdc += amountUsdc;
       } else {
-        this.positions.set(tokenId, { conditionId, outcome, shares, costUsdc: amountUsdc });
+        this.positions.set(tokenId, { conditionId, outcome, shares, costUsdc: amountUsdc, openedAt: Date.now() });
       }
     } else {
       if (!existing) return;
@@ -298,6 +321,7 @@ export class CopyController extends EventEmitter implements StrategyController {
       this.ledger.release('copy-trade', pos.costUsdc);
     }
     this.positions.clear();
+    this.latestPrices.clear();
     this._status = 'stopped';
     this._emitStatus();
   }

@@ -7,8 +7,11 @@ interface CacheEntry<T> {
   expiresAt: number;
 }
 
+const SWEEP_EVERY_N_SETS = 200;
+
 export class Cache {
   private store: Map<string, CacheEntry<unknown>> = new Map();
+  private setsSinceSweep = 0;
 
   /**
    * Get a cached value
@@ -31,6 +34,27 @@ export class Cache {
       value,
       expiresAt: Date.now() + ttlMs,
     });
+
+    // get() only evicts expired entries lazily, on lookup of that exact key.
+    // Keys that are set once and never looked up again (e.g. markets that
+    // rotate out) would otherwise accumulate forever, so sweep periodically.
+    this.setsSinceSweep++;
+    if (this.setsSinceSweep >= SWEEP_EVERY_N_SETS) {
+      this.setsSinceSweep = 0;
+      this.sweepExpired();
+    }
+  }
+
+  /**
+   * Remove all expired entries
+   */
+  private sweepExpired(): void {
+    const now = Date.now();
+    for (const [key, entry] of this.store) {
+      if (now > entry.expiresAt) {
+        this.store.delete(key);
+      }
+    }
   }
 
   /**

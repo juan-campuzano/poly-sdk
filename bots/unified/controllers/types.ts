@@ -34,6 +34,8 @@ export interface StrategyParams {
   priceFilterMin: number;
   priceFilterMax: number;
   topN: number;
+  maxPositions: number;
+  maxPositionAgeMs: number;
 }
 
 export const DEFAULT_PARAMS: Record<StrategyKind, Partial<StrategyParams>> = {
@@ -53,6 +55,8 @@ export const DEFAULT_PARAMS: Record<StrategyKind, Partial<StrategyParams>> = {
     priceFilterMin: 0.10,
     priceFilterMax: 0.80,
     topN: 50,
+    maxPositions: 10,
+    maxPositionAgeMs: 8 * 3600 * 1000, // 8 hours
   },
   'dip-arb': {
     maxSizePerTradeUsdc: 20,
