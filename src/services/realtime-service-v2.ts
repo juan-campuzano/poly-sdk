@@ -624,6 +624,10 @@ export class RealtimeServiceV2 extends EventEmitter {
           this.accumulatedMarketTokenIds.delete(tokenId);
           // Stop awaiting ack for tokens we're explicitly unsubscribing.
           this.pendingSubAck.delete(tokenId);
+          // Otherwise these caches accumulate one entry per assetId ever seen.
+          this.priceCache.delete(tokenId);
+          this.bookCache.delete(tokenId);
+          this.lastTradeCache.delete(tokenId);
         }
 
         // H0 fix (2026-05-03): explicit UNSUBSCRIBE to server
