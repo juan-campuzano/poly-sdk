@@ -1,5 +1,6 @@
 import { EventEmitter } from 'events';
 import type { DipArbMarketConfig, DipArbSignal, DipArbExecutionResult, DipArbRoundResult } from '../../../src/services/dip-arb-service.ts';
+import { calculateDipArbProfitRate } from '../../../src/services/dip-arb-service.ts';
 import { PolymarketSDK } from '../../../src/index.ts';
 import { getLogger } from '../../../src/core/logger.ts';
 import type {
@@ -21,6 +22,15 @@ export class DipArbController extends EventEmitter implements StrategyController
   private _currentMarket: DipArbMarketConfig | null = null;
   private _openPositions: Position[] = [];
   private _realizedPnl = 0;
+  private _simRound: {
+    roundId: string;
+    dipSide: 'UP' | 'DOWN';
+    entryPrice: number;
+    sizeUsdc: number;
+    tokenId: string;
+    startedAt: number;
+  } | null = null;
+  private _simHedgeCheckInterval: ReturnType<typeof setInterval> | null = null;
 
   constructor(
     private sdk: PolymarketSDK,
@@ -114,11 +124,12 @@ export class DipArbController extends EventEmitter implements StrategyController
       // (happens when the watched market expires or resolves).
       service.on('started', (market: import('../../../src/services/dip-arb-types.ts').DipArbMarketConfig) => {
         this._currentMarket = market;
-        // Clear any stuck simulated position from the old market
+        // Clear any stuck simulated position/round from the old market
         if (this._openPositions.length > 0) {
           for (const pos of this._openPositions) this.ledger.release('dip-arb', pos.costBasisUsdc);
           this._openPositions = [];
         }
+        this._simRound = null;
         this._emitStatus();
         log.info(`[dip-arb-controller] rotated to: ${market.name}`);
       });
@@ -150,18 +161,16 @@ export class DipArbController extends EventEmitter implements StrategyController
   }
 
   private _handleSimulatedSignal(signal: DipArbSignal): void {
-    if (signal.type !== 'leg1') return; // only simulate leg1 entry signals
+    if (signal.type !== 'leg1') return; // only open sim rounds on leg1 entry signals
 
-    // One simulated position at a time — skip new signals while a round is in flight
-    if (this._openPositions.length > 0) return;
+    // One simulated round at a time — skip new signals while a round is in flight
+    if (this._simRound) return;
 
     const sizeUsdc = this._params.maxSizePerTradeUsdc ?? 20;
     const reserved = this.ledger.reserve('dip-arb', sizeUsdc);
     if (!reserved.ok) return;
 
     const entryPrice = signal.targetPrice;
-    const estimatedProfitRate = signal.estimatedProfitRate ?? 0.02;
-
     const tokenId = signal.tokenId || (this._currentMarket?.upTokenId ?? '');
 
     const trade: Trade = {
@@ -193,33 +202,76 @@ export class DipArbController extends EventEmitter implements StrategyController
     this._openPositions = [pos];
     this.emit('position', pos);
 
-    setTimeout(() => {
-      // Use the signal's estimatedProfitRate for sim P&L — this is what the
-      // strategy actually expects to capture on a successful round.
-      const pnl = sizeUsdc * estimatedProfitRate;
-      const exitValue = sizeUsdc + pnl;
-      const exitPrice = Math.min(entryPrice * (exitValue / sizeUsdc), 0.99);
+    // Don't fake a profit yet — a Leg1 entry alone isn't a completed arb.
+    // Wait for the opposite side's live ask to actually drop enough that
+    // entryPrice + hedgePrice <= sumTarget (the same gate the real Leg2
+    // detector uses), mirroring what the live strategy would do.
+    this._simRound = { roundId: signal.roundId, dipSide: signal.dipSide, entryPrice, sizeUsdc, tokenId, startedAt: Date.now() };
+    this._ensureSimHedgeCheckLoop();
+  }
 
-      this._realizedPnl += pnl;
-      this.ledger.release('dip-arb', sizeUsdc);
-      this._openPositions = [];
+  private _ensureSimHedgeCheckLoop(): void {
+    if (this._simHedgeCheckInterval) return;
+    this._simHedgeCheckInterval = setInterval(() => this._checkSimHedge(), 1000);
+  }
 
-      const closeTrade: Trade = {
-        loggedAt: new Date().toISOString(),
-        strategy: 'dip-arb',
-        mode: 'dry-run',
-        marketName: this._currentMarket?.name ?? 'unknown',
-        conditionId: this._currentMarket?.conditionId,
-        tokenId: this._currentMarket?.upTokenId ?? '',
-        side: 'SELL',
-        price: exitPrice,
-        sizeUsdc: exitValue,
-        result: 'success',
-        reason: 'dip-arb-sim-close',
-      };
-      this.emit('trade', closeTrade);
-      this._emitStatus();
-    }, 5000);
+  private _checkSimHedge(): void {
+    const round = this._simRound;
+    if (!round) return;
+
+    const service = this.sdk.dipArb;
+    const asks = service.getCurrentAsks();
+    const oppositeAsk = round.dipSide === 'UP' ? asks.down : asks.up;
+    const sameSideAsk = round.dipSide === 'UP' ? asks.up : asks.down;
+    const config = service.getConfig();
+    const elapsedSec = (Date.now() - round.startedAt) / 1000;
+
+    if (oppositeAsk != null) {
+      const hedgePrice = oppositeAsk * (1 + (config.maxSlippage ?? 0.02));
+      const totalCost = round.entryPrice + hedgePrice;
+
+      if (totalCost <= (config.sumTarget ?? 0.92)) {
+        const profitRate = calculateDipArbProfitRate(totalCost);
+        this._closeSimRound(round, hedgePrice, round.sizeUsdc * profitRate, 'dip-arb-hedge-close');
+        return;
+      }
+    }
+
+    // No profitable hedge showed up in time — exit the unhedged leg1 leg,
+    // same as the live strategy's emergency exit on Leg2 timeout.
+    if (elapsedSec > (config.leg2TimeoutSeconds ?? 180)) {
+      const exitPrice = sameSideAsk ?? round.entryPrice;
+      const pnl = round.sizeUsdc * ((exitPrice - round.entryPrice) / round.entryPrice);
+      this._closeSimRound(round, exitPrice, pnl, 'dip-arb-leg2-timeout');
+    }
+  }
+
+  private _closeSimRound(
+    round: NonNullable<typeof this._simRound>,
+    exitPrice: number,
+    pnl: number,
+    reason: string,
+  ): void {
+    this._realizedPnl += pnl;
+    this.ledger.release('dip-arb', round.sizeUsdc);
+    this._openPositions = [];
+    this._simRound = null;
+
+    const closeTrade: Trade = {
+      loggedAt: new Date().toISOString(),
+      strategy: 'dip-arb',
+      mode: 'dry-run',
+      marketName: this._currentMarket?.name ?? 'unknown',
+      conditionId: this._currentMarket?.conditionId,
+      tokenId: round.tokenId,
+      side: 'SELL',
+      price: exitPrice,
+      sizeUsdc: round.sizeUsdc + pnl,
+      result: 'success',
+      reason,
+    };
+    this.emit('trade', closeTrade);
+    this._emitStatus();
   }
 
   pause(): void {
@@ -236,6 +288,11 @@ export class DipArbController extends EventEmitter implements StrategyController
 
   async stop(): Promise<void> {
     try { await this.sdk.dipArb.stop(); } catch { /* best effort */ }
+    if (this._simHedgeCheckInterval) {
+      clearInterval(this._simHedgeCheckInterval);
+      this._simHedgeCheckInterval = null;
+    }
+    this._simRound = null;
     for (const pos of this._openPositions) {
       this.ledger.release('dip-arb', pos.costBasisUsdc);
     }

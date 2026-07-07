@@ -493,6 +493,17 @@ export class DipArbService extends EventEmitter {
   }
 
   /**
+   * Get current best ask on each side (read-only snapshot of live orderbook state).
+   * Used by dry-run simulators to price a hedge without needing an executed Leg1.
+   */
+  getCurrentAsks(): { up: number | null; down: number | null } {
+    return {
+      up: this.upAsks[0]?.price ?? null,
+      down: this.downAsks[0]?.price ?? null,
+    };
+  }
+
+  /**
    * Get current round state
    */
   getCurrentRound(): DipArbRoundState | null {
