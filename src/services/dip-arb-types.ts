@@ -85,6 +85,15 @@ export interface DipArbServiceConfig {
   leg2TimeoutSeconds?: number;
 
   /**
+   * 入场截止（分钟）
+   * 距离市场 endTime 不足此分钟数时，不再开新轮次 / 不再触发 Leg1。
+   * 临近到期的 "dip" 是市场在定价最终结果（不会均值回归），
+   * 且对手侧 ask ≈ 0.99，Leg2 对冲永远无法达到 sumTarget。
+   * @default 5
+   */
+  entryCutoffMinutes?: number;
+
+  /**
    * 启用暴涨检测
    * 当 token 价格暴涨时，买入对手 token（预期均值回归）
    * @default true
@@ -171,6 +180,7 @@ export const DEFAULT_DIP_ARB_CONFIG: DipArbConfigInternal = {
   maxSlippage: 0.02,
   minProfitRate: 0.03,
   leg2TimeoutSeconds: 180,  // ✅ 缩短到 3 分钟，更快退出未对冲仓位
+  entryCutoffMinutes: 5,    // 距到期 <5 分钟不再入场（到期前的 dip 不回归）
   enableSurge: true,
   surgeThreshold: 0.15,
   autoMerge: true,

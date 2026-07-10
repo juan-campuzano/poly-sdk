@@ -31,6 +31,8 @@ export class DipArbController extends EventEmitter implements StrategyController
     startedAt: number;
   } | null = null;
   private _simHedgeCheckInterval: ReturnType<typeof setInterval> | null = null;
+  // Set after a simulated leg2-timeout loss: no re-entry until market rotation
+  private _simHaltUntilRotation = false;
 
   constructor(
     private sdk: PolymarketSDK,
@@ -63,7 +65,7 @@ export class DipArbController extends EventEmitter implements StrategyController
         autoExecute: this._mode === 'live',
         sumTarget: this._params.sumTarget ?? 0.92,
         dipThreshold: this._params.dipThreshold ?? 0.15,
-        shares: (this._params.maxSizePerTradeUsdc ?? 20),
+        shares: (this._params.maxSizePerTradeUsdc ?? 10),
       });
 
       service.on('signal', (signal: DipArbSignal) => {
@@ -78,7 +80,7 @@ export class DipArbController extends EventEmitter implements StrategyController
       // handler above, so skip here to avoid emitting the trade twice.
       service.on('execution', (result: DipArbExecutionResult) => {
         if (this._paused || this._mode === 'dry-run') return;
-        const sizeUsdc = this._params.maxSizePerTradeUsdc ?? 20;
+        const sizeUsdc = this._params.maxSizePerTradeUsdc ?? 10;
         const reserved = this.ledger.reserve('dip-arb', sizeUsdc);
         const trade: Trade = {
           loggedAt: new Date().toISOString(),
@@ -100,7 +102,7 @@ export class DipArbController extends EventEmitter implements StrategyController
 
       service.on('roundComplete', (round: DipArbRoundResult) => {
         this._realizedPnl += round.profit ?? 0;
-        const sizeUsdc = this._params.maxSizePerTradeUsdc ?? 20;
+        const sizeUsdc = this._params.maxSizePerTradeUsdc ?? 10;
         this.ledger.release('dip-arb', sizeUsdc);
         this._openPositions = [];
         this._emitStatus();
@@ -130,6 +132,7 @@ export class DipArbController extends EventEmitter implements StrategyController
           this._openPositions = [];
         }
         this._simRound = null;
+        this._simHaltUntilRotation = false;
         this._emitStatus();
         log.info(`[dip-arb-controller] rotated to: ${market.name}`);
       });
@@ -166,7 +169,10 @@ export class DipArbController extends EventEmitter implements StrategyController
     // One simulated round at a time — skip new signals while a round is in flight
     if (this._simRound) return;
 
-    const sizeUsdc = this._params.maxSizePerTradeUsdc ?? 20;
+    // A leg2 timeout in this market proved the dip was directional — wait for rotation
+    if (this._simHaltUntilRotation) return;
+
+    const sizeUsdc = this._params.maxSizePerTradeUsdc ?? 10;
     const reserved = this.ledger.reserve('dip-arb', sizeUsdc);
     if (!reserved.ok) return;
 
@@ -242,6 +248,8 @@ export class DipArbController extends EventEmitter implements StrategyController
     if (elapsedSec > (config.leg2TimeoutSeconds ?? 180)) {
       const exitPrice = sameSideAsk ?? round.entryPrice;
       const pnl = round.sizeUsdc * ((exitPrice - round.entryPrice) / round.entryPrice);
+      this._simHaltUntilRotation = true;
+      log.info('[dip-arb-controller] leg2 timeout — halting entries until market rotation');
       this._closeSimRound(round, exitPrice, pnl, 'dip-arb-leg2-timeout');
     }
   }
@@ -293,6 +301,7 @@ export class DipArbController extends EventEmitter implements StrategyController
       this._simHedgeCheckInterval = null;
     }
     this._simRound = null;
+    this._simHaltUntilRotation = false;
     for (const pos of this._openPositions) {
       this.ledger.release('dip-arb', pos.costBasisUsdc);
     }

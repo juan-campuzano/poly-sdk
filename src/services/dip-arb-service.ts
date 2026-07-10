@@ -118,6 +118,9 @@ export class DipArbService extends EventEmitter {
   private priceHistory: Array<{ timestamp: number; upAsk: number; downAsk: number }> = [];
   private readonly MAX_HISTORY_LENGTH = 100;  // Keep last 100 price points
 
+  // Set after a Leg2 timeout: no more entries in this market until rotation
+  private haltEntriesUntilRotation = false;
+
   // Price state
   private currentUnderlyingPrice = 0;
 
@@ -303,6 +306,7 @@ export class DipArbService extends EventEmitter {
     this.isRunning = true;
     this.stats = createDipArbInitialStats();
     this.priceHistory = [];  // Clear price history for new market
+    this.haltEntriesUntilRotation = false;  // New market: entries allowed again
 
     this.log(`Starting Dip Arb monitor for: ${market.name}`);
     this.log(`Condition ID: ${market.conditionId.slice(0, 20)}...`);
@@ -1023,6 +1027,12 @@ export class DipArbService extends EventEmitter {
         return;
       }
 
+      // No new rounds inside the entry cutoff window before market end
+      if (this.isWithinEntryCutoff()) return;
+
+      // No re-entry after a Leg2 timeout in this market
+      if (this.haltEntriesUntilRotation) return;
+
       // Get current prices
       const upPrice = this.upAsks[0]?.price ?? 0.5;
       const downPrice = this.downAsks[0]?.price ?? 0.5;
@@ -1064,6 +1074,10 @@ export class DipArbService extends EventEmitter {
       if (elapsed > this.config.leg2TimeoutSeconds) {
         // ✅ FIX: Exit Leg1 position to avoid unhedged exposure
         this.log(`⚠️ Leg2 timeout (${elapsed.toFixed(0)}s > ${this.config.leg2TimeoutSeconds}s), exiting Leg1 position...`);
+
+        // This market already proved the dip was directional (no hedge showed
+        // up) — stop opening rounds here and wait for rotation to a new market.
+        this.haltEntriesUntilRotation = true;
 
         // Try to sell Leg1 position
         const exitResult = await this.emergencyExitLeg1();
@@ -1184,6 +1198,17 @@ export class DipArbService extends EventEmitter {
     return null;
   }
 
+  /**
+   * True when the market is inside the entry cutoff window before endTime.
+   * Near expiry a "dip" is the market pricing the final outcome (no mean
+   * reversion) and the opposite ask ≈ 0.99, so Leg2 can never hedge.
+   */
+  private isWithinEntryCutoff(): boolean {
+    if (!this.market) return false;
+    const cutoffMs = this.config.entryCutoffMinutes * 60_000;
+    return Date.now() >= this.market.endTime.getTime() - cutoffMs;
+  }
+
   private detectLeg1Signal(): DipArbLeg1Signal | null {
     if (!this.currentRound || !this.market) return null;
 
@@ -1192,6 +1217,10 @@ export class DipArbService extends EventEmitter {
     if (elapsed > this.config.windowMinutes) {
       return null;
     }
+
+    // A round opened earlier may still be waiting — block late Leg1 entries too
+    if (this.isWithinEntryCutoff()) return null;
+    if (this.haltEntriesUntilRotation) return null;
 
     const upPrice = this.upAsks[0]?.price ?? 1;
     const downPrice = this.downAsks[0]?.price ?? 1;

@@ -28,6 +28,7 @@ export class ArbitrageController extends EventEmitter implements StrategyControl
   private _marketEndTime: number | null = null;
   private _rotateInterval: ReturnType<typeof setInterval> | null = null;
   private _rotating = false;
+  private _heartbeatInterval: ReturnType<typeof setInterval> | null = null;
   private _realizedPnl = 0;
   private _openPositions: Position[] = [];
 
@@ -153,6 +154,7 @@ export class ArbitrageController extends EventEmitter implements StrategyControl
       // 5m markets expire within ~30 min of starting — without rotation the
       // service ends up watching a dead orderbook forever (0 trades in days).
       this._ensureRotationLoop();
+      this._ensureHeartbeat();
     } catch (err) {
       this._status = 'error';
       const msg = err instanceof Error ? err.message : String(err);
@@ -217,6 +219,27 @@ export class ArbitrageController extends EventEmitter implements StrategyControl
     }, 30_000);
   }
 
+  /**
+   * Periodic diagnostic: arbitrage has produced 0 trades across multi-day
+   * runs and the trade log alone can't tell whether the service is watching
+   * a live orderbook or how far prices are from the profit threshold.
+   */
+  private _ensureHeartbeat(): void {
+    if (this._heartbeatInterval) return;
+    this._heartbeatInterval = setInterval(() => {
+      if (this._status !== 'running') return;
+      try {
+        const ob = this.service.getOrderbook();
+        const yesAsk = ob.yesAsks[0]?.price;
+        const noAsk = ob.noAsks[0]?.price;
+        const stats = this.service.getStats();
+        const longCost = yesAsk != null && noAsk != null ? (yesAsk + noAsk).toFixed(4) : 'n/a';
+        const arbBelow = (1 - (this._params.profitThreshold ?? 0.005)).toFixed(3);
+        log.info(`[arb-controller] heartbeat: ${this._currentMarket?.name ?? 'no market'} | YES+NO ask sum=${longCost} (arb if <${arbBelow}) | opportunities=${stats.opportunitiesDetected}`);
+      } catch { /* orderbook not ready yet */ }
+    }, 5 * 60_000);
+  }
+
   private async _maybeRotate(): Promise<void> {
     if (this._rotating || this._paused) return;
     const expired = this._marketEndTime != null && Date.now() >= this._marketEndTime;
@@ -249,6 +272,10 @@ export class ArbitrageController extends EventEmitter implements StrategyControl
     if (this._rotateInterval) {
       clearInterval(this._rotateInterval);
       this._rotateInterval = null;
+    }
+    if (this._heartbeatInterval) {
+      clearInterval(this._heartbeatInterval);
+      this._heartbeatInterval = null;
     }
     try {
       await this.service.stop();

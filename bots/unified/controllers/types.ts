@@ -61,7 +61,9 @@ export const DEFAULT_PARAMS: Record<StrategyKind, Partial<StrategyParams>> = {
     maxPositionAgeMs: 8 * 3600 * 1000, // 8 hours
   },
   'dip-arb': {
-    maxSizePerTradeUsdc: 20,
+    // $20 was 40% of the default $50 bankroll per round — one bad unhedged
+    // round (leg2 timeout near expiry) erased a full day of copy-trade gains
+    maxSizePerTradeUsdc: 10,
     minTradeSizeUsdc: 5,
     sumTarget: 0.92,
     dipThreshold: 0.15,
