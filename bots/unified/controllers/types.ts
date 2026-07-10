@@ -50,8 +50,10 @@ export const DEFAULT_PARAMS: Record<StrategyKind, Partial<StrategyParams>> = {
     maxPositionUsdc: 5,
     minTradeSizeUsdc: 0.5,  // must be < maxSizePerTradeUsdc or no trades ever fire
     maxSlippage: 0.03,
-    takeProfitPercent: 0.10,
-    stopLossPercent: 0.20,
+    // TP must be >= SL: with the old 10%/20% split, sim data showed winners
+    // paying +$0.16 avg while losers cost -$1.05 avg (net -72 USD over a day)
+    takeProfitPercent: 0.15,
+    stopLossPercent: 0.10,
     priceFilterMin: 0.10,
     priceFilterMax: 0.80,
     topN: 50,

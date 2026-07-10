@@ -25,6 +25,9 @@ export class ArbitrageController extends EventEmitter implements StrategyControl
   private _paused = false;
   private _params: Partial<StrategyParams>;
   private _currentMarket: ArbitrageMarketConfig | null = null;
+  private _marketEndTime: number | null = null;
+  private _rotateInterval: ReturnType<typeof setInterval> | null = null;
+  private _rotating = false;
   private _realizedPnl = 0;
   private _openPositions: Position[] = [];
 
@@ -146,50 +149,87 @@ export class ArbitrageController extends EventEmitter implements StrategyControl
       this._status = 'running';
       this._paused = false;
       this._emitStatus();
-
-      const candidates = await this.sdk.markets.scanCryptoShortTermMarkets({
-        coin: 'all',
-        duration: '5m',
-        minMinutesUntilEnd: 2,
-        maxMinutesUntilEnd: 30,
-        limit: 10,
-        sortBy: 'endDate',
-      });
-
-      if (candidates.length === 0) {
-        this._status = 'degraded';
-        this.emit('error', { message: 'No short-term crypto markets found' });
-        this._emitStatus();
-        return;
-      }
-
-      const candidate = candidates[0];
-      const clobMarket = await this.sdk.markets.getMarket(candidate.conditionId);
-      const [upToken, downToken] = clobMarket.tokens;
-
-      if (!upToken || !downToken) {
-        this._status = 'error';
-        this.emit('error', { message: `Market "${candidate.question}" missing tokens` });
-        this._emitStatus();
-        return;
-      }
-
-      this._currentMarket = {
-        name: candidate.question,
-        conditionId: candidate.conditionId,
-        yesTokenId: upToken.tokenId,
-        noTokenId: downToken.tokenId,
-        outcomes: [upToken.outcome, downToken.outcome] as [string, string],
-      };
-
-      this.service = this._buildService();
-      this._wireService();
-      await this.service.start(this._currentMarket);
+      await this._scanAndStart();
+      // 5m markets expire within ~30 min of starting — without rotation the
+      // service ends up watching a dead orderbook forever (0 trades in days).
+      this._ensureRotationLoop();
     } catch (err) {
       this._status = 'error';
       const msg = err instanceof Error ? err.message : String(err);
       this.emit('error', { message: msg });
       this._emitStatus();
+    }
+  }
+
+  private async _scanAndStart(): Promise<void> {
+    const candidates = await this.sdk.markets.scanCryptoShortTermMarkets({
+      coin: 'all',
+      duration: '5m',
+      minMinutesUntilEnd: 2,
+      maxMinutesUntilEnd: 30,
+      limit: 10,
+      sortBy: 'endDate',
+    });
+
+    if (candidates.length === 0) {
+      this._status = 'degraded';
+      this.emit('error', { message: 'No short-term crypto markets found' });
+      this._emitStatus();
+      return;
+    }
+
+    const candidate = candidates[0];
+    const clobMarket = await this.sdk.markets.getMarket(candidate.conditionId);
+    const [upToken, downToken] = clobMarket.tokens;
+
+    if (!upToken || !downToken) {
+      this._status = 'error';
+      this.emit('error', { message: `Market "${candidate.question}" missing tokens` });
+      this._emitStatus();
+      return;
+    }
+
+    this._currentMarket = {
+      name: candidate.question,
+      conditionId: candidate.conditionId,
+      yesTokenId: upToken.tokenId,
+      noTokenId: downToken.tokenId,
+      outcomes: [upToken.outcome, downToken.outcome] as [string, string],
+    };
+    this._marketEndTime = candidate.endDate ? new Date(candidate.endDate).getTime() : null;
+
+    this.service = this._buildService();
+    this._wireService();
+    await this.service.start(this._currentMarket);
+    this._status = 'running';
+    this._emitStatus();
+    log.info(`[arb-controller] watching: ${candidate.question}`);
+  }
+
+  private _ensureRotationLoop(): void {
+    if (this._rotateInterval) return;
+    this._rotateInterval = setInterval(() => {
+      this._maybeRotate().catch((err) => {
+        log.warn(`[arb-controller] rotation error: ${err instanceof Error ? err.message : String(err)}`);
+        this._status = 'degraded';
+        this._emitStatus();
+      });
+    }, 30_000);
+  }
+
+  private async _maybeRotate(): Promise<void> {
+    if (this._rotating || this._paused) return;
+    const expired = this._marketEndTime != null && Date.now() >= this._marketEndTime;
+    // Rotate when the watched market expired, or retry the scan while degraded
+    // (e.g. no candidates were available on the previous attempt).
+    if (!(expired && this._status === 'running') && this._status !== 'degraded') return;
+
+    this._rotating = true;
+    try {
+      try { await this.service.stop(); } catch { /* old market may already be dead */ }
+      await this._scanAndStart();
+    } finally {
+      this._rotating = false;
     }
   }
 
@@ -206,6 +246,10 @@ export class ArbitrageController extends EventEmitter implements StrategyControl
   }
 
   async stop(): Promise<void> {
+    if (this._rotateInterval) {
+      clearInterval(this._rotateInterval);
+      this._rotateInterval = null;
+    }
     try {
       await this.service.stop();
     } catch { /* best effort */ }

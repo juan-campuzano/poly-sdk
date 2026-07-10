@@ -485,8 +485,12 @@ export class MarketService {
   async getMidpoint(tokenId: string): Promise<number> {
     const client = await this.ensureInitialized();
     return this.rateLimiter.execute(ApiType.CLOB_API, async () => {
+      // clob-client returns the raw REST payload: { mid: "0.725" }
       const midpoint = await client.getMidpoint(tokenId);
-      return Number(midpoint);
+      const value = typeof midpoint === 'object' && midpoint !== null
+        ? (midpoint as { mid?: string | number }).mid
+        : midpoint;
+      return Number(value);
     });
   }
 

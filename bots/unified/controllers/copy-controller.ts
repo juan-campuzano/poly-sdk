@@ -15,6 +15,10 @@ const log = getLogger();
 
 const STALE_TRADE_MS = 60_000;
 
+// Half-spread cost applied to simulated fills so dry-run doesn't assume
+// frictionless execution at the observed price.
+const SIM_FRICTION = 0.01;
+
 interface OwnPosition {
   conditionId: string;
   outcome?: string;
@@ -54,14 +58,14 @@ export class CopyController extends EventEmitter implements StrategyController {
       this._emitStatus();
 
       const topN = this._params.topN ?? 50;
-      const wallets = await this.sdk.smartMoneyCore.getSmartMoneyList(topN);
-      const targetAddresses = wallets.map((w) => w.address);
+      const targetAddresses = await this._selectLeaders(topN);
 
       this.monitor = new TradeMonitor(this.sdk.dataApi, { pollIntervalMs: 5_000 });
       this.copyEngine = new CopyEngine(this.sdk.tradingService);
 
+      const targetSet = new Set(targetAddresses);
       this.monitor.on('trade', (tradeEvent: TradeEvent) => {
-        if (targetAddresses.includes(tradeEvent.address ?? '')) {
+        if (targetSet.has((tradeEvent.address ?? '').toLowerCase())) {
           this._handleLeaderTrade(tradeEvent).catch((err) => {
             log.warn(`[copy-controller] trade handling error: ${err instanceof Error ? err.message : String(err)}`);
           });
@@ -90,7 +94,11 @@ export class CopyController extends EventEmitter implements StrategyController {
 
       // Risk check loop (take-profit / stop-loss)
       const checkIntervalMs = 10_000;
-      this.riskInterval = setInterval(() => this._runRiskCheck(), checkIntervalMs);
+      this.riskInterval = setInterval(() => {
+        this._runRiskCheck().catch((err) => {
+          log.warn(`[copy-controller] risk check error: ${err instanceof Error ? err.message : String(err)}`);
+        });
+      }, checkIntervalMs);
 
       this._emitStatus();
     } catch (err) {
@@ -99,6 +107,31 @@ export class CopyController extends EventEmitter implements StrategyController {
       this.emit('error', { message: msg });
       this._emitStatus();
     }
+  }
+
+  /**
+   * Pick leaders worth copying from the weekly leaderboard instead of raw
+   * all-time PnL. The weekly endpoint doesn't populate tradeCount/makerVolume,
+   * so the quality gate is return-on-volume: a real edge shows as pnl that is
+   * a meaningful fraction of volume, while churners and market makers show
+   * huge volume with thin pnl.
+   */
+  private async _selectLeaders(topN: number): Promise<string[]> {
+    const lb = await this.sdk.smartMoneyCore.getLeaderboard({ period: 'week', limit: 200, sortBy: 'pnl' });
+    const curated = lb.entries
+      .filter((e) => e.pnl > 0 && e.volume >= 10_000 && e.pnl / e.volume >= 0.05)
+      .slice(0, topN)
+      .map((e) => e.address.toLowerCase());
+
+    if (curated.length > 0) {
+      log.info(`[copy-controller] following ${curated.length} curated weekly leaders`);
+      return curated;
+    }
+    // Curation came up empty (API hiccup / missing fields) — fall back to the
+    // old all-time list rather than following nobody.
+    log.warn('[copy-controller] leader curation empty, falling back to all-time smart money list');
+    const wallets = await this.sdk.smartMoneyCore.getSmartMoneyList(topN);
+    return wallets.map((w) => w.address.toLowerCase());
   }
 
   private async _handleLeaderTrade(tradeEvent: TradeEvent): Promise<void> {
@@ -122,9 +155,19 @@ export class CopyController extends EventEmitter implements StrategyController {
       if (tradeEvent.price < priceMin || tradeEvent.price > priceMax) return;
 
       const maxPos = this._params.maxPositions ?? 10;
-      if (!this.positions.has(tradeEvent.tokenId) && this.positions.size >= maxPos) return;
+      const existing = this.positions.get(tradeEvent.tokenId);
+      if (!existing && this.positions.size >= maxPos) return;
 
-      const existingCost = this.positions.get(tradeEvent.tokenId)?.costUsdc ?? 0;
+      // Never average down: only add to a position that is at/above its
+      // average entry. Adding to losers is what concentrated the losses
+      // (losers grew to the cap while winners exited small).
+      if (existing) {
+        const avgEntry = existing.costUsdc / existing.shares;
+        const mark = this.latestPrices.get(tradeEvent.tokenId) ?? tradeEvent.price;
+        if (mark < avgEntry) return;
+      }
+
+      const existingCost = existing?.costUsdc ?? 0;
       const roomInPosition = (this._params.maxPositionUsdc ?? 5) - existingCost;
       if (roomInPosition <= 0) return;
 
@@ -162,62 +205,109 @@ export class CopyController extends EventEmitter implements StrategyController {
           this._emitTrade(tradeEvent, 'BUY', sizeUsdc, 'failed', 'leader', err instanceof Error ? err.message : String(err));
         }
       } else {
-        // dry-run simulated fill
-        this._recordFill(tradeEvent.tokenId, tradeEvent.conditionId, tradeEvent.outcome, 'BUY', sizeUsdc, tradeEvent.price);
+        // dry-run simulated fill — pay half-spread instead of assuming a
+        // fill at the leader's exact price
+        const fillPrice = Math.min(tradeEvent.price * (1 + SIM_FRICTION), 1);
+        this._recordFill(tradeEvent.tokenId, tradeEvent.conditionId, tradeEvent.outcome, 'BUY', sizeUsdc, fillPrice);
         this._emitTrade(tradeEvent, 'BUY', sizeUsdc, 'success', 'leader');
         this._emitPosition(tradeEvent.tokenId, tradeEvent.conditionId, tradeEvent.outcome);
       }
     } else {
       // SELL — mirror only if we hold this token
-      const pos = this.positions.get(tradeEvent.tokenId);
-      if (!pos) return;
-
-      const sellValue = pos.shares * tradeEvent.price;
-      this._realizedPnl += sellValue - pos.costUsdc;
-      // Release what was originally committed (cost basis), not sell proceeds
-      this.ledger.release('copy-trade', pos.costUsdc);
-      // _closePositionInternal removes the position and emits the SELL trade
-      this._closePositionInternal(tradeEvent.tokenId, tradeEvent.price, 'leader');
-      this._emitStatus();
+      if (!this.positions.has(tradeEvent.tokenId)) return;
+      await this._closePosition(tradeEvent.tokenId, tradeEvent.price, 'leader');
     }
   }
 
-  private _runRiskCheck(): void {
-    const now = Date.now();
-    const maxAgeMs = this._params.maxPositionAgeMs ?? 8 * 3600 * 1000;
+  private _riskCheckInFlight = false;
 
-    for (const [tokenId, pos] of this.positions) {
-      // Auto-close positions held past the TTL regardless of price
-      if (now - pos.openedAt >= maxAgeMs) {
+  private async _runRiskCheck(): Promise<void> {
+    if (this._riskCheckInFlight || this.positions.size === 0) return;
+    this._riskCheckInFlight = true;
+    try {
+      // Mark to market from the CLOB — leader-trade prices alone go stale
+      // whenever no watched wallet touches a token we hold.
+      await this._refreshPositionPrices();
+
+      const now = Date.now();
+      const maxAgeMs = this._params.maxPositionAgeMs ?? 8 * 3600 * 1000;
+
+      for (const [tokenId, pos] of [...this.positions]) {
         const price = this.latestPrices.get(tokenId) ?? pos.costUsdc / pos.shares;
-        const currentValue = pos.shares * price;
-        this._realizedPnl += currentValue - pos.costUsdc;
-        this.ledger.release('copy-trade', pos.costUsdc);
-        this._closePositionInternal(tokenId, price, 'ttl_expired');
-        this._emitStatus();
-        continue;
+
+        // Auto-close positions held past the TTL regardless of price
+        if (now - pos.openedAt >= maxAgeMs) {
+          await this._closePosition(tokenId, price, 'ttl_expired');
+          continue;
+        }
+
+        const pnlPercent = (pos.shares * price - pos.costUsdc) / pos.costUsdc;
+        const tp = this._params.takeProfitPercent ?? 0.15;
+        const sl = this._params.stopLossPercent ?? 0.10;
+
+        if (pnlPercent >= tp) {
+          await this._closePosition(tokenId, price, 'take_profit');
+        } else if (pnlPercent <= -sl) {
+          await this._closePosition(tokenId, price, 'stop_loss');
+        }
       }
+    } finally {
+      this._riskCheckInFlight = false;
+    }
+  }
 
-      // Fall back to entry price if no update has arrived yet
-      const price = this.latestPrices.get(tokenId) ?? pos.costUsdc / pos.shares;
-      const currentValue = pos.shares * price;
-      const pnlPercent = (currentValue - pos.costUsdc) / pos.costUsdc;
+  private async _refreshPositionPrices(): Promise<void> {
+    await Promise.all(
+      [...this.positions.keys()].map(async (tokenId) => {
+        try {
+          const mid = await this.sdk.markets.getMidpoint(tokenId);
+          if (Number.isFinite(mid) && mid > 0) this.latestPrices.set(tokenId, mid);
+        } catch { /* keep last known price */ }
+      }),
+    );
+  }
 
-      const tp = this._params.takeProfitPercent ?? 0.10;
-      const sl = this._params.stopLossPercent ?? 0.20;
+  /**
+   * Close a position: in live mode place a real FOK sell first (previously
+   * risk closes only mutated internal state — live TP/SL never sold anything);
+   * in dry-run pay half-spread on the exit. Releases the reserved cost basis
+   * (releasing current value instead was leaking phantom committed capital
+   * into the ledger on every stop-loss, starving future buys).
+   */
+  private async _closePosition(tokenId: string, markPrice: number, reason: string): Promise<void> {
+    const pos = this.positions.get(tokenId);
+    if (!pos) return;
 
-      if (pnlPercent >= tp) {
-        this._closePositionInternal(tokenId, price, 'take_profit');
-        this.ledger.release('copy-trade', currentValue);
-        this._realizedPnl += currentValue - pos.costUsdc;
-        this._emitStatus();
-      } else if (pnlPercent <= -sl) {
-        this._closePositionInternal(tokenId, price, 'stop_loss');
-        this.ledger.release('copy-trade', currentValue);
-        this._realizedPnl += currentValue - pos.costUsdc;
-        this._emitStatus();
+    const exitPrice = this._mode === 'live'
+      ? markPrice
+      : Math.max(0, markPrice * (1 - SIM_FRICTION));
+
+    if (this._mode === 'live' && this.copyEngine) {
+      try {
+        // SELL market orders take `amount` in shares (clob UserMarketOrder semantics)
+        const result = await this.copyEngine.executeOrder({
+          conditionId: pos.conditionId,
+          tokenId,
+          outcome: pos.outcome ?? '',
+          side: 'SELL',
+          amount: pos.shares,
+          price: exitPrice,
+          orderType: 'FOK',
+        });
+        if (!result.success) {
+          log.warn(`[copy-controller] live close (${reason}) failed for ${tokenId.slice(0, 10)}: ${result.errorMsg ?? 'unknown'}`);
+          return; // keep the position; next risk tick retries
+        }
+      } catch (err) {
+        log.warn(`[copy-controller] live close (${reason}) error for ${tokenId.slice(0, 10)}: ${err instanceof Error ? err.message : String(err)}`);
+        return;
       }
     }
+
+    this._realizedPnl += pos.shares * exitPrice - pos.costUsdc;
+    this.ledger.release('copy-trade', pos.costUsdc);
+    this._closePositionInternal(tokenId, exitPrice, reason);
+    this._emitStatus();
   }
 
   private _closePositionInternal(tokenId: string, price: number, reason: string): void {
