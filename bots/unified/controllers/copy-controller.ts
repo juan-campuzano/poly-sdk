@@ -230,7 +230,9 @@ export class CopyController extends EventEmitter implements StrategyController {
       await this._refreshPositionPrices();
 
       const now = Date.now();
-      const maxAgeMs = this._params.maxPositionAgeMs ?? 8 * 3600 * 1000;
+      const maxAgeMs = this._params.maxPositionAgeMs ?? 2 * 3600 * 1000;
+      const stagnantExitMs = this._params.stagnantExitMs ?? 30 * 60 * 1000;
+      const stagnantBand = this._params.stagnantBandPercent ?? 0.02;
 
       for (const [tokenId, pos] of [...this.positions]) {
         const price = this.latestPrices.get(tokenId) ?? pos.costUsdc / pos.shares;
@@ -249,6 +251,10 @@ export class CopyController extends EventEmitter implements StrategyController {
           await this._closePosition(tokenId, price, 'take_profit');
         } else if (pnlPercent <= -sl) {
           await this._closePosition(tokenId, price, 'stop_loss');
+        } else if (now - pos.openedAt >= stagnantExitMs && Math.abs(pnlPercent) < stagnantBand) {
+          // Dead position: free the reserved capital instead of tying it up
+          // until TTL — the leader signal that opened it clearly didn't move.
+          await this._closePosition(tokenId, price, 'stagnant');
         }
       }
     } finally {

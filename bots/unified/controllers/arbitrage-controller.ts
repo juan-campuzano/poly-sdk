@@ -52,6 +52,10 @@ export class ArbitrageController extends EventEmitter implements StrategyControl
       autoExecute: this._mode === 'live',
       enableLogging: false,
       logger: log,
+      // checkOpportunity() sizes trades off the real on-chain USDC balance,
+      // which is unfunded/absent in this paper-trading setup — without this
+      // every opportunity's maxSize computes to 0 and never fires.
+      virtualBalanceUsdc: this._mode === 'dry-run' ? (this._params.maxSizePerTradeUsdc ?? 50) * 2 : undefined,
     });
   }
 

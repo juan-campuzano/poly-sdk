@@ -36,6 +36,8 @@ export interface StrategyParams {
   topN: number;
   maxPositions: number;
   maxPositionAgeMs: number;
+  stagnantExitMs: number;
+  stagnantBandPercent: number;
 }
 
 export const DEFAULT_PARAMS: Record<StrategyKind, Partial<StrategyParams>> = {
@@ -58,7 +60,14 @@ export const DEFAULT_PARAMS: Record<StrategyKind, Partial<StrategyParams>> = {
     priceFilterMax: 0.80,
     topN: 50,
     maxPositions: 10,
-    maxPositionAgeMs: 8 * 3600 * 1000, // 8 hours
+    // Shortened from 8h: sim data showed 20 TTL closures over 22h, all just
+    // paying round-trip friction on flat positions — capital sitting idle
+    // instead of cycling into fresh leader signals.
+    maxPositionAgeMs: 2 * 3600 * 1000, // 2 hours
+    // Close early if a position hasn't moved beyond this band after
+    // stagnantExitMs — frees capital sooner than waiting the full TTL.
+    stagnantExitMs: 30 * 60 * 1000, // 30 minutes
+    stagnantBandPercent: 0.02,
   },
   'dip-arb': {
     // $20 was 40% of the default $50 bankroll per round — one bad unhedged

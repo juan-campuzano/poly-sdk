@@ -91,6 +91,15 @@ export interface ArbitrageServiceConfig {
   sizeSafetyFactor?: number;
   /** Auto-fix imbalance after failed execution (default: true) */
   autoFixImbalance?: boolean;
+  /**
+   * Simulated USDC balance for opportunity sizing (dry-run only).
+   * checkOpportunity() always sizes trades off the real on-chain balance
+   * (via CTFClient), which is completely disconnected from a paper-trading
+   * bankroll — without a funded wallet `balance.usdc` stays 0 forever and
+   * no opportunity can ever clear `minTradeSize`. Set this to bypass the
+   * real balance query entirely and size against this virtual figure.
+   */
+  virtualBalanceUsdc?: number;
   /** Optional structured logger, propagated to the internal RealtimeServiceV2 watchdog */
   logger?: Logger;
 }
@@ -258,11 +267,12 @@ export class ArbitrageService extends EventEmitter {
   private rateLimiter: RateLimiter;
 
   private market: ArbitrageMarketConfig | null = null;
-  private config: Omit<Required<ArbitrageServiceConfig>, 'privateKey' | 'rpcUrl' | 'rebalanceInterval' | 'logger'> & {
+  private config: Omit<Required<ArbitrageServiceConfig>, 'privateKey' | 'rpcUrl' | 'rebalanceInterval' | 'logger' | 'virtualBalanceUsdc'> & {
     privateKey?: string;
     rpcUrl?: string;
     rebalanceIntervalMs: number;
     logger?: Logger;
+    virtualBalanceUsdc?: number;
   };
 
   private orderbook: OrderbookState = {
@@ -321,6 +331,7 @@ export class ArbitrageService extends EventEmitter {
       // Execution safety
       sizeSafetyFactor: config.sizeSafetyFactor ?? 0.8,
       autoFixImbalance: config.autoFixImbalance ?? true,
+      virtualBalanceUsdc: config.virtualBalanceUsdc,
       logger: config.logger,
     };
 
@@ -362,6 +373,14 @@ export class ArbitrageService extends EventEmitter {
     this.log(`Condition ID: ${market.conditionId.slice(0, 20)}...`);
     this.log(`Profit Threshold: ${(this.config.profitThreshold * 100).toFixed(2)}%`);
     this.log(`Auto Execute: ${this.config.autoExecute ? 'YES' : 'NO'}`);
+
+    // Dry-run: size opportunities off a virtual balance instead of the real
+    // on-chain wallet (which is either unfunded or entirely absent here).
+    if (this.config.virtualBalanceUsdc != null) {
+      this.balance = { usdc: this.config.virtualBalanceUsdc, yesTokens: 0, noTokens: 0, lastUpdate: Date.now() };
+      this.totalCapital = this.balance.usdc;
+      this.log(`Virtual USDC Balance: ${this.balance.usdc.toFixed(2)} (dry-run sizing, no real wallet queried)`);
+    }
 
     // Initialize trading service
     if (this.tradingService) {
@@ -1352,6 +1371,9 @@ export class ArbitrageService extends EventEmitter {
   }
 
   private async updateBalance(): Promise<void> {
+    // Virtual balance is seeded once in start() and never overwritten by a
+    // real (irrelevant) on-chain query while in dry-run.
+    if (this.config.virtualBalanceUsdc != null) return;
     if (!this.ctf || !this.market) return;
 
     try {

@@ -96,7 +96,7 @@ export interface DipArbServiceConfig {
   /**
    * 启用暴涨检测
    * 当 token 价格暴涨时，买入对手 token（预期均值回归）
-   * @default true
+   * @default false — 生产数据显示单笔亏损 -6.30（两个session中最差单笔结果）
    */
   enableSurge?: boolean;
 
@@ -181,7 +181,12 @@ export const DEFAULT_DIP_ARB_CONFIG: DipArbConfigInternal = {
   minProfitRate: 0.03,
   leg2TimeoutSeconds: 180,  // ✅ 缩短到 3 分钟，更快退出未对冲仓位
   entryCutoffMinutes: 5,    // 距到期 <5 分钟不再入场（到期前的 dip 不回归）
-  enableSurge: true,
+  // Surge buys the side that DIDN'T move, betting the other side's spike
+  // reverts — but in a 15m crypto Up/Down market a sudden move is usually
+  // the real underlying price feed (informed), not noise. Sim data: the
+  // one surge trade in production lost -6.30, the worst per-trade result
+  // of either session. Disabled until surge has its own tighter gate.
+  enableSurge: false,
   surgeThreshold: 0.15,
   autoMerge: true,
   autoExecute: false,
